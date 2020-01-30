@@ -21,17 +21,43 @@ def get_weight(weight_shape, gain, lrmul):
                              initializer=tf.initializers.random_normal(0, init_std)) * runtime_coef
     return weight
 
-def conv(x, channels, kernel=3, stride=1, gain=np.sqrt(2), lrmul=1.0, sn=False, scope='conv_0'):
+def conv(x, channels, dlatents=None, t_rgb=False, kernel=3, stride=1, gain=np.sqrt(2), lrmul=1.0, sn=False, scope='conv_0'):
     with tf.variable_scope(scope):
         weight_shape = [kernel, kernel, x.get_shape().as_list()[-1], channels]
+        weight       = get_weight(weight_shape, gain, lrmul)
+        
+        # 生成器要從W空間獲取風格(Style)
+        if dlatents is not None:
+            ww    = weight[np.newaxis]                          # Introduce minibatch dimension : [N,K,K,inC,channels]
+            style = style_mod(x, dlatents)
+            ww    = ww * tf.cast(style[:, np.newaxis, np.newaxis, :, np.newaxis], ww.dtype) # Scale input feature maps
 
-        weight = get_weight(weight_shape, gain, lrmul)
+            # Demodulate if t_rgb is False
+            if t_rgb == False:
+                d   = tf.rsqrt(tf.reduce_sum(tf.square(ww), axis=[1,2,3]) + 1e-8) # Scaling factor.
+                ww  = ww * d[:, np.newaxis, np.newaxis, np.newaxis, :]            # Scale output feature maps.
+                
+            # Reshape/scale input
+            x = tf.reshape(x, [1, x.shape[1], x.shape[2], -1])                    # Reshape minibatch to convolution groups.
 
-        if sn :
-            weight = spectral_norm(weight)
+            # [N, K, K, inC, channels] -> [K, K, inC, N, channels] -> [K, K, inC, channels]
+            w = tf.reshape(tf.transpose(ww, [1, 2, 3, 0, 4]), weight_shape)
 
-        x = tf.nn.conv2d(input=x, filter=weight, strides=[1, stride, stride, 1], padding='SAME')
+            # Convolution with optional up/downsampling.
+            if up:
+                x = upsample_conv_2d(x, tf.cast(w, x.dtype), k=resample_kernel)
+            elif down:
+                x = conv_downsample_2d(x, tf.cast(w, x.dtype), k=resample_kernel)
+            else:
+                x = tf.nn.conv2d(x, tf.cast(w, x.dtype), strides=[1,1,1,1], padding='SAME')
 
+            # Reshape convolution groups back to minibatch.
+            x = tf.reshape(x, [-1, x.shape[1], x.shape[2], channels])
+            
+        else:
+            # fromrgb
+            x = tf.nn.conv2d(input=x, filter=weight, strides=[1, stride, stride, 1], padding='SAME')
+         
         return x
 
 def fully_connected(x, units, gain=np.sqrt(2), lrmul=1.0, sn=False, scope='linear'):
@@ -100,7 +126,7 @@ def pixel_norm(x, epsilon=1e-8):
     return x
 
 def adaptive_instance_norm(x, w):
-    x = instance_norm(x)
+    #x = instance_norm(x)
     x = style_mod(x, w)
     return x
 
@@ -191,7 +217,7 @@ def get_alpha_const(iterations, batch_size, global_step) :
 # StyleGAN discriminator
 ##################################################################################
 
-def discriminator_block(x, res, n_f0, n_f1, sn=False):
+def discriminator_block(x, res, n_f0, n_f1, sn=False, is_mod=False):
     with tf.variable_scope('{:d}x{:d}'.format(res, res)):
         with tf.variable_scope('Conv0'):
             x = conv(x, channels=n_f0, kernel=3, stride=1, gain=np.sqrt(2), lrmul=1.0, sn=sn)
@@ -249,7 +275,7 @@ def get_style_class(resolutions, featuremaps) :
 
 def synthesis_const_block(res, w_broadcasted, n_f, sn=False):
     w0 = w_broadcasted[:, 0]
-    w1 = w_broadcasted[:, 1]
+    #w1 = w_broadcasted[:, 1]
 
 
     batch_size = tf.shape(w0)[0]
@@ -258,21 +284,21 @@ def synthesis_const_block(res, w_broadcasted, n_f, sn=False):
         with tf.variable_scope('const_block'):
             x = tf.get_variable('Const', shape=[1, 4, 4, n_f], dtype=tf.float32, initializer=tf.initializers.ones())
             x = tf.tile(x, [batch_size, 1, 1, 1])
-
+            '''
             x = apply_noise(x) # B module
             x = apply_bias(x, lrmul=1.0)
 
             x = lrelu(x, 0.2)
             x = adaptive_instance_norm(x, w0) # A module
-
+            '''
         with tf.variable_scope('Conv'):
-            x = conv(x, channels=n_f, kernel=3, stride=1, gain=np.sqrt(2), lrmul=1.0, sn=sn)
+            x = conv(x, channels=n_f, dlatents=w0, kernel=3, stride=1, gain=np.sqrt(2), lrmul=1.0, sn=sn)
 
             x = apply_noise(x) # B module
+            
             x = apply_bias(x, lrmul=1.0)
-
             x = lrelu(x, 0.2)
-            x = adaptive_instance_norm(x, w1) # A module
+            #x = adaptive_instance_norm(x, w1) # A module
 
     return x
 
@@ -371,12 +397,12 @@ def fromrgb(x, res, n_f, sn=False):
 
 def style_mod(x, w):
     with tf.variable_scope('StyleMod'):
-        units = x.shape[-1] * 2
+        units = x.shape[-1]
         style = fully_connected(w, units=units, gain=1.0, lrmul=1.0)
         style = apply_bias(style, lrmul=1.0)
 
-        style = tf.reshape(style, [-1, 2, 1, 1, x.shape[-1]])
-        x = x * (style[:, 0] + 1) + style[:, 1]
+        #style = tf.reshape(style, [-1, 1, 1, 1, x.shape[-1]])
+        #x     = x * (style[:, 0] + 1)
 
     return x
 
